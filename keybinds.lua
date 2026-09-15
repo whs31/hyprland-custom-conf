@@ -19,3 +19,10 @@ for i = 1, 10 do
         hl.dispatch(hl.dsp.window.move({ workspace = workspace_in_group(i), follow = true }))
     end)
 end
+
+hl.unbind("SUPER + L")
+hl.bind(
+    "SUPER + L",
+    hl.dsp.exec_cmd("qs -c $qsConfig ipc call lock activate || hyprlock"),
+    { description = "Session: Lock" }
+)
