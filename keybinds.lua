@@ -26,3 +26,9 @@ hl.bind(
     hl.dsp.exec_cmd("qs -c $qsConfig ipc call lock activate || hyprlock"),
     { description = "Session: Lock" }
 )
+
+hl.bind(
+    "SUPER + U",
+    hl.dsp.exec_cmd("qs -p $HOME/.config/hypr/custom/ai-usage ipc call aiUsage toggle"),
+    { description = "Shell: Toggle Claude and Codex usage" }
+)
