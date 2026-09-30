@@ -29,6 +29,6 @@ hl.bind(
 
 hl.bind(
     "SUPER + U",
-    hl.dsp.exec_cmd("qs -p $HOME/.config/hypr/custom/ai-usage ipc call aiUsage toggle"),
+    hl.dsp.exec_cmd("qs -p $HOME/.config/hypr/custom/ai-usage ipc call aiUsage toggle || $HOME/.config/hypr/custom/ai-usage/launch.sh --now"),
     { description = "Shell: Toggle Claude and Codex usage" }
 )

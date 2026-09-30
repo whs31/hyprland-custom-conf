@@ -1,7 +1,9 @@
 //@ pragma Env QT_QUICK_CONTROLS_STYLE=Basic
 
 import QtQuick
+import QtQuick.Effects
 import QtQuick.Layouts
+import QtQuick.Shapes
 import Quickshell
 import Quickshell.Hyprland
 import Quickshell.Io
@@ -11,31 +13,46 @@ import Quickshell.Widgets
 ShellRoot {
     id: root
 
-    property bool expanded: false
+    property bool expanded: Quickshell.env("AI_USAGE_OPEN") === "1"
     property bool loading: false
     property bool parsedCurrentRequest: false
     property string backendError: ""
     property var providers: ({})
     property double nowMs: Date.now()
     property date lastUpdated: new Date(0)
-    property var palette: ({
+    // Unmapping and remapping the pill puts it back on top of the Top layer.
+    property bool pillMapped: true
+    property var colors: ({
         background: "#131312",
         on_background: "#e4e2df",
         on_surface_variant: "#c5c7bf",
+        outline: "#8f9189",
         primary: "#c0cab6",
+        surface_container_low: "#1b1c1a",
         surface_container: "#1f201e",
         surface_container_high: "#2a2a28",
+        surface_container_highest: "#353533",
         outline_variant: "#454841",
         error: "#ffb4ab",
-        error_container: "#93000a"
+        error_container: "#93000a",
+        on_error_container: "#ffdad6"
     })
 
     readonly property string home: Quickshell.env("HOME")
     readonly property string fontFamily: "Google Sans Flex"
     readonly property string monoFamily: "JetBrains Mono NF"
-    // Position immediately after end4's centred controls on a 1920 px display.
+    readonly property string iconFamily: "Material Symbols Rounded"
+    readonly property var providerIds: ["claude", "codex"]
+    readonly property color warningColor: "#f3b562"
+    // end4 bar geometry: 40 px tall, groups inset by 4 px, 12 px radius.
+    readonly property int barHeight: 40
+    readonly property int popupWidth: 372
+    // Position immediately after end4's centred controls.
     // Keep this as one obvious knob for layouts with a different bar width.
     property int compactBarOffsetFromCenter: 490
+
+    readonly property var targetScreen: Quickshell.screens.find(screen => screen.name === Hyprland.focusedMonitor?.name) ?? Quickshell.screens[0] ?? null
+    readonly property int pillX: Math.round((targetScreen?.width ?? 1920) / 2 + compactBarOffsetFromCenter)
 
     function refresh() {
         if (usageProcess.running)
@@ -44,6 +61,18 @@ ShellRoot {
         root.parsedCurrentRequest = false;
         root.backendError = "";
         usageProcess.running = true;
+    }
+
+    function refreshIfStale() {
+        if (Date.now() - root.lastUpdated.getTime() > 60000)
+            root.refresh();
+    }
+
+    function restackPill() {
+        if (!root.pillMapped)
+            return;
+        root.pillMapped = false;
+        restackTimer.restart();
     }
 
     function consumeOutput(text) {
@@ -65,7 +94,7 @@ ShellRoot {
             root.parsedCurrentRequest = true;
             root.backendError = "";
         } catch (error) {
-            root.backendError = "Не удалось прочитать ответ CodexBar";
+            root.backendError = "Could not parse CodexBar output";
             console.warn("[ai-usage] JSON parse failed:", error);
         }
     }
@@ -74,17 +103,41 @@ ShellRoot {
         return root.providers[providerId] ?? null;
     }
 
+    function providerName(providerId) {
+        return providerId === "claude" ? "Claude" : "Codex";
+    }
+
+    function providerPlan(providerId) {
+        const data = root.providerData(providerId);
+        return data?.usage?.identity?.loginMethod ?? data?.usage?.loginMethod ?? "";
+    }
+
     function providerError(providerId) {
         const data = root.providerData(providerId);
         if (!data)
-            return root.backendError || (root.loading ? "Обновление…" : "Нет данных");
+            return root.backendError || (root.loading ? "" : "No data yet");
         const message = data.error?.message ?? "";
         const lower = message.toLowerCase();
         if (lower.includes("not installed"))
-            return "Установи codexbar-cli";
-        if (lower.includes("expired") || lower.includes("run `claude login`"))
-            return "Сессия истекла — выполни claude login";
+            return "Install codexbar-cli to see usage";
+        if (lower.includes("expired") || lower.includes("invalid") || lower.includes("login"))
+            return `Session expired — run ${providerId} login`;
         return message;
+    }
+
+    function windowLabel(key, label, minutes) {
+        const normalized = (label ?? "").toLowerCase();
+        if (normalized === "weekly" || normalized === "week")
+            return "Weekly";
+        if (normalized === "session" || normalized.includes("5-hour") || normalized.includes("five hour"))
+            return "5-hour session";
+        if (label)
+            return label;
+        if (minutes > 0 && minutes <= 360)
+            return "5-hour session";
+        if (minutes > 0 && minutes <= 10080)
+            return "Weekly";
+        return key === "primary" ? "Session" : key === "secondary" ? "Weekly" : "Limit";
     }
 
     function windowsFor(providerId) {
@@ -98,66 +151,68 @@ ShellRoot {
             if (!windowData)
                 continue;
 
-            let label = data.rateWindowLabels?.[key] ?? "";
-            const normalizedLabel = label.toLowerCase();
-            if (normalizedLabel === "weekly" || normalizedLabel === "week")
-                label = "Неделя";
-            else if (normalizedLabel.includes("5-hour") || normalizedLabel.includes("five hour"))
-                label = "5 часов";
-            else if (normalizedLabel === "session")
-                label = "Сессия";
-            if (!label) {
-                const minutes = windowData.windowMinutes ?? 0;
-                if (minutes > 0 && minutes <= 360)
-                    label = "5 часов";
-                else if (minutes > 0 && minutes <= 10080)
-                    label = "Неделя";
-                else
-                    label = key === "primary" ? "Сессия" : key === "secondary" ? "Неделя" : "Лимит";
-            }
-
+            const pace = data.pace?.[key] ?? null;
             result.push({
                 key: key,
-                label: label,
+                label: root.windowLabel(key, data.rateWindowLabels?.[key], windowData.windowMinutes ?? 0),
                 usedPercent: Math.max(0, Math.min(100, windowData.usedPercent ?? 0)),
-                resetsAt: windowData.resetsAt ?? ""
+                resetsAt: windowData.resetsAt ?? "",
+                expectedPercent: pace?.expectedUsedPercent ?? -1,
+                paceText: root.paceText(pace),
+                paceWarning: pace ? pace.willLastToReset === false : false
             });
         }
         return result;
     }
 
-    function compactPercent(providerId) {
-        const windows = root.windowsFor(providerId);
-        if (windows.length === 0)
-            return "—";
-        return `${Math.round(windows[0].usedPercent)}%`;
+    // CodexBar summaries look like "On pace | Expected 10% used | Runs out in 5d 17h".
+    function paceText(pace) {
+        if (!pace?.summary)
+            return "";
+        const parts = pace.summary.split("|").map(part => part.trim());
+        if (pace.willLastToReset === false && parts.length > 2)
+            return parts[2];
+        return parts[0];
     }
 
-    function compactValue(providerId) {
+    function primaryPercent(providerId) {
         const windows = root.windowsFor(providerId);
-        return windows.length > 0 ? windows[0].usedPercent : 0;
+        return windows.length > 0 ? windows[0].usedPercent : -1;
+    }
+
+    function levelColor(value, accent) {
+        if (value >= 90)
+            return root.colors.error;
+        if (value >= 75)
+            return root.warningColor;
+        return accent;
+    }
+
+    function formatDuration(totalMinutes) {
+        if (totalMinutes < 60)
+            return `${totalMinutes}m`;
+        const hours = Math.floor(totalMinutes / 60);
+        if (hours < 24)
+            return `${hours}h ${totalMinutes % 60}m`;
+        return `${Math.floor(hours / 24)}d ${hours % 24}h`;
     }
 
     function formatReset(isoTime) {
         // Make this binding depend on the minute timer.
         const ignored = root.nowMs;
         if (!isoTime)
-            return "время сброса неизвестно";
-        const remaining = new Date(isoTime).getTime() - Date.now();
+            return "Reset time unknown";
+        const resetDate = new Date(isoTime);
+        const remaining = resetDate.getTime() - Date.now();
         if (!Number.isFinite(remaining))
-            return "время сброса неизвестно";
+            return "Reset time unknown";
         if (remaining <= 0)
-            return "сбрасывается сейчас";
+            return "Resetting now";
 
-        const totalMinutes = Math.ceil(remaining / 60000);
-        if (totalMinutes < 60)
-            return `сброс через ${totalMinutes} мин`;
-        const hours = Math.floor(totalMinutes / 60);
-        const minutes = totalMinutes % 60;
-        if (hours < 24)
-            return `сброс через ${hours} ч ${minutes} мин`;
-        const days = Math.floor(hours / 24);
-        return `сброс через ${days} д ${hours % 24} ч`;
+        const days = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+        const clock = Qt.formatTime(resetDate, "HH:mm");
+        const at = remaining < 86400000 ? clock : `${days[resetDate.getDay()]} ${clock}`;
+        return `Resets in ${root.formatDuration(Math.ceil(remaining / 60000))} · ${at}`;
     }
 
     function providerAccent(providerId) {
@@ -173,7 +228,7 @@ ShellRoot {
         if (!text || text.trim().length === 0)
             return;
         try {
-            root.palette = Object.assign({}, root.palette, JSON.parse(text));
+            root.colors = Object.assign({}, root.colors, JSON.parse(text));
         } catch (error) {
             console.warn("[ai-usage] Could not load end4 palette:", error);
         }
@@ -185,7 +240,6 @@ ShellRoot {
         interval: 300000
         repeat: true
         running: true
-        triggeredOnStart: false
         onTriggered: root.refresh()
     }
 
@@ -194,6 +248,23 @@ ShellRoot {
         repeat: true
         running: true
         onTriggered: root.nowMs = Date.now()
+    }
+
+    Timer {
+        id: restackTimer
+        interval: 120
+        onTriggered: root.pillMapped = true
+    }
+
+    // Both this pill and the end4 bar live on the Top layer, where the most
+    // recently mapped surface is drawn last. The bar is recreated on startup,
+    // after unlocking and on shell reloads, so jump back above it each time.
+    Connections {
+        target: Hyprland
+        function onRawEvent(event) {
+            if (event.name === "openlayer" && event.data.trim() === "quickshell:bar")
+                root.restackPill();
+        }
     }
 
     FileView {
@@ -214,7 +285,7 @@ ShellRoot {
         onExited: (exitCode, exitStatus) => {
             root.loading = false;
             if (!root.parsedCurrentRequest && !root.backendError)
-                root.backendError = exitCode === 124 ? "CodexBar не ответил вовремя" : "CodexBar завершился с ошибкой";
+                root.backendError = exitCode === 124 ? "CodexBar timed out" : "CodexBar exited with an error";
         }
     }
 
@@ -224,12 +295,12 @@ ShellRoot {
         function toggle(): void {
             root.expanded = !root.expanded;
             if (root.expanded)
-                root.refresh();
+                root.refreshIfStale();
         }
 
         function open(): void {
             root.expanded = true;
-            root.refresh();
+            root.refreshIfStale();
         }
 
         function close(): void {
@@ -241,197 +312,306 @@ ShellRoot {
         }
     }
 
-    PanelWindow {
-        id: panel
+    HyprlandFocusGrab {
+        active: root.expanded && popup.visible
+        windows: [popup, pill]
+        onCleared: root.expanded = false
+    }
 
-        screen: Quickshell.screens.find(screen => screen.name === Hyprland.focusedMonitor?.name) ?? null
-        visible: true
+    // Compact pill that sits inside the bar.
+    PanelWindow {
+        id: pill
+
+        screen: root.targetScreen
+        visible: root.pillMapped
         color: "transparent"
         exclusionMode: ExclusionMode.Ignore
         exclusiveZone: 0
-        implicitWidth: root.expanded ? 420 : 156
-        implicitHeight: root.expanded ? expandedContent.implicitHeight + 28 : 40
+        implicitWidth: pillBody.implicitWidth
+        implicitHeight: root.barHeight
 
         WlrLayershell.namespace: "quickshell:aiUsage"
         WlrLayershell.layer: WlrLayer.Top
         WlrLayershell.keyboardFocus: WlrKeyboardFocus.None
 
         anchors {
-            left: !root.expanded
-            right: root.expanded
+            left: true
             bottom: true
         }
-        margins {
-            // The end4 middle section ends about 490 px to the right of the
-            // screen centre with the current verbose 1920 px bar layout.
-            // Put the compact widget directly after that group.
-            left: root.expanded ? 0 : Math.round((panel.screen?.width ?? 1920) / 2 + root.compactBarOffsetFromCenter)
-            right: root.expanded ? 10 : 0
-            bottom: root.expanded ? 48 : 0
-        }
+        margins.left: root.pillX
 
-        mask: Region { item: panelCard }
-
-        Behavior on implicitWidth {
-            NumberAnimation { duration: 180; easing.type: Easing.OutCubic }
-        }
-        Behavior on implicitHeight {
-            NumberAnimation { duration: 180; easing.type: Easing.OutCubic }
-        }
+        mask: Region { item: pillBody }
 
         Rectangle {
-            id: panelCard
+            id: pillBody
+
             anchors {
                 fill: parent
-                topMargin: root.expanded ? 0 : 4
-                bottomMargin: root.expanded ? 0 : 4
+                topMargin: 4
+                bottomMargin: 4
             }
-            color: !root.expanded && compactMouse.containsMouse
-                ? root.palette.surface_container_high
-                : root.palette.surface_container
-            border.width: root.expanded ? 1 : 0
-            border.color: root.palette.outline_variant
-            radius: root.expanded ? 18 : 8
-            clip: true
+            implicitWidth: pillRow.implicitWidth + 16
+            radius: 12
+            color: root.expanded
+                ? root.colors.surface_container_high
+                : pillMouse.containsMouse ? root.colors.surface_container : root.colors.surface_container_low
 
-            Behavior on radius { NumberAnimation { duration: 180 } }
+            Behavior on color { ColorAnimation { duration: 120 } }
 
-            ColumnLayout {
-                id: compactContent
-                anchors.fill: parent
-                anchors.leftMargin: 5
-                anchors.rightMargin: 5
-                anchors.topMargin: 2
-                anchors.bottomMargin: 2
-                spacing: 0
-                visible: !root.expanded
-                opacity: visible ? 1 : 0
+            RowLayout {
+                id: pillRow
+                anchors.centerIn: parent
+                spacing: 10
+                opacity: root.loading && root.lastUpdated.getTime() === 0 ? 0.5 : 1
 
-                CompactProvider {
-                    Layout.fillWidth: true
-                    providerId: "claude"
-                }
-
-                CompactProvider {
-                    Layout.fillWidth: true
-                    providerId: "codex"
+                Repeater {
+                    model: root.providerIds
+                    delegate: PillProvider {
+                        required property string modelData
+                        providerId: modelData
+                    }
                 }
             }
 
             MouseArea {
-                id: compactMouse
-                anchors.fill: compactContent
-                enabled: !root.expanded
+                id: pillMouse
+                anchors.fill: parent
                 acceptedButtons: Qt.LeftButton | Qt.RightButton
                 hoverEnabled: true
                 cursorShape: Qt.PointingHandCursor
                 onClicked: event => {
-                    if (event.button === Qt.RightButton)
+                    if (event.button === Qt.RightButton) {
                         root.refresh();
-                    else
-                        root.expanded = true;
+                    } else {
+                        root.expanded = !root.expanded;
+                        if (root.expanded)
+                            root.refreshIfStale();
+                    }
                 }
             }
+        }
+    }
 
-            ColumnLayout {
-                id: expandedContent
-                anchors {
-                    top: parent.top
-                    left: parent.left
-                    right: parent.right
-                    margins: 14
-                }
-                spacing: 10
-                visible: root.expanded
-                opacity: visible ? 1 : 0
+    // Detail popup. Overlay so that it opens above fullscreen windows too.
+    PanelWindow {
+        id: popup
 
-                RowLayout {
-                    Layout.fillWidth: true
+        property real reveal: root.expanded ? 1 : 0
+        Behavior on reveal {
+            NumberAnimation { duration: 200; easing.type: Easing.OutCubic }
+        }
 
-                    Text {
-                        text: "Claude + Codex"
-                        color: root.palette.on_background
-                        font.family: root.fontFamily
-                        font.pixelSize: 17
-                        font.weight: Font.DemiBold
+        screen: root.targetScreen
+        visible: root.expanded || reveal > 0
+        color: "transparent"
+        exclusionMode: ExclusionMode.Ignore
+        exclusiveZone: 0
+        implicitWidth: root.popupWidth + 2 * shadowMargin
+        implicitHeight: card.implicitHeight + 2 * shadowMargin
+
+        readonly property int shadowMargin: 16
+
+        WlrLayershell.namespace: "quickshell:aiUsagePopup"
+        WlrLayershell.layer: WlrLayer.Overlay
+        WlrLayershell.keyboardFocus: root.expanded ? WlrKeyboardFocus.OnDemand : WlrKeyboardFocus.None
+
+        anchors {
+            left: true
+            bottom: true
+        }
+        margins {
+            left: Math.max(0, Math.min(root.pillX - shadowMargin, (root.targetScreen?.width ?? 1920) - implicitWidth - 4))
+            bottom: root.barHeight + 6 - shadowMargin
+        }
+
+        mask: Region { item: card }
+
+        Item {
+            id: sheet
+            x: popup.shadowMargin
+            y: popup.shadowMargin
+            width: card.width
+            height: card.height
+            opacity: popup.reveal
+            transform: Translate { y: (1 - popup.reveal) * 12 }
+
+            RectangularShadow {
+                anchors.fill: card
+                radius: card.radius
+                blur: 18
+                spread: 1
+                offset: Qt.vector2d(0, 3)
+                color: Qt.rgba(0, 0, 0, 0.45)
+            }
+
+            Rectangle {
+                id: card
+
+                width: root.popupWidth
+                implicitHeight: cardColumn.implicitHeight + 28
+                height: implicitHeight
+                radius: 22
+                color: root.colors.surface_container
+                border.width: 1
+                border.color: Qt.alpha(root.colors.outline_variant, 0.6)
+
+                focus: root.expanded
+                Keys.onEscapePressed: root.expanded = false
+                Keys.onPressed: event => {
+                    if (event.key === Qt.Key_R || event.key === Qt.Key_F5) {
+                        root.refresh();
+                        event.accepted = true;
                     }
+                }
 
-                    Item { Layout.fillWidth: true }
+                ColumnLayout {
+                    id: cardColumn
+                    anchors {
+                        top: parent.top
+                        left: parent.left
+                        right: parent.right
+                        margins: 14
+                    }
+                    spacing: 10
 
-                    Rectangle {
-                        Layout.preferredWidth: 30
-                        Layout.preferredHeight: 30
-                        radius: 15
-                        color: refreshMouse.containsMouse ? root.palette.surface_container_high : "transparent"
-                        Text {
-                            anchors.centerIn: parent
-                            text: root.loading ? "…" : "↻"
-                            color: root.palette.on_surface_variant
-                            font.family: root.fontFamily
-                            font.pixelSize: 18
+                    RowLayout {
+                        Layout.fillWidth: true
+                        Layout.leftMargin: 4
+                        spacing: 6
+
+                        ColumnLayout {
+                            Layout.fillWidth: true
+                            spacing: 0
+
+                            UiText {
+                                Layout.fillWidth: true
+                                text: "AI usage"
+                                font.pixelSize: 17
+                                font.weight: Font.DemiBold
+                            }
+                            UiText {
+                                Layout.fillWidth: true
+                                text: root.loading
+                                    ? "Refreshing…"
+                                    : root.lastUpdated.getTime() > 0
+                                        ? `Updated ${Qt.formatTime(root.lastUpdated, "HH:mm")}`
+                                        : "Waiting for data"
+                                color: root.colors.on_surface_variant
+                                font.pixelSize: 11
+                            }
                         }
-                        MouseArea {
-                            id: refreshMouse
-                            anchors.fill: parent
-                            hoverEnabled: true
-                            cursorShape: Qt.PointingHandCursor
+
+                        IconButton {
+                            icon: "refresh"
+                            spinning: root.loading
                             onClicked: root.refresh()
                         }
-                    }
-
-                    Rectangle {
-                        Layout.preferredWidth: 30
-                        Layout.preferredHeight: 30
-                        radius: 15
-                        color: closeMouse.containsMouse ? root.palette.surface_container_high : "transparent"
-                        Text {
-                            anchors.centerIn: parent
-                            text: "×"
-                            color: root.palette.on_surface_variant
-                            font.family: root.fontFamily
-                            font.pixelSize: 20
-                        }
-                        MouseArea {
-                            id: closeMouse
-                            anchors.fill: parent
-                            hoverEnabled: true
-                            cursorShape: Qt.PointingHandCursor
+                        IconButton {
+                            icon: "close"
                             onClicked: root.expanded = false
                         }
                     }
-                }
 
-                ProviderCard {
-                    Layout.fillWidth: true
-                    providerId: "claude"
-                    providerName: "Claude"
-                }
-
-                ProviderCard {
-                    Layout.fillWidth: true
-                    providerId: "codex"
-                    providerName: "Codex"
-                }
-
-                RowLayout {
-                    Layout.fillWidth: true
-                    Text {
-                        text: root.lastUpdated.getTime() > 0
-                            ? `Обновлено ${Qt.formatTime(root.lastUpdated, "HH:mm")}`
-                            : "Ожидание данных"
-                        color: root.palette.on_surface_variant
-                        font.family: root.fontFamily
-                        font.pixelSize: 11
+                    Repeater {
+                        model: root.providerIds
+                        delegate: ProviderCard {
+                            required property string modelData
+                            Layout.fillWidth: true
+                            providerId: modelData
+                        }
                     }
-                    Item { Layout.fillWidth: true }
-                    Text {
-                        text: "Super+U"
-                        color: root.palette.on_surface_variant
-                        font.family: root.monoFamily
-                        font.pixelSize: 10
+
+                    RowLayout {
+                        Layout.fillWidth: true
+                        Layout.leftMargin: 4
+                        Layout.rightMargin: 4
+                        spacing: 6
+
+                        UiText {
+                            Layout.fillWidth: true
+                            text: "Tick marks expected usage · refreshes every 5 min"
+                            color: root.colors.outline
+                            font.pixelSize: 10
+                            elide: Text.ElideRight
+                        }
+                        Keycap { text: "Super" }
+                        Keycap { text: "U" }
                     }
                 }
             }
+        }
+    }
+
+    component UiText: Text {
+        color: root.colors.on_background
+        font.family: root.fontFamily
+        font.pixelSize: 12
+    }
+
+    component Symbol: Text {
+        property real fill: 0
+        property real iconSize: 18
+        color: root.colors.on_surface_variant
+        renderType: Text.NativeRendering
+        font.family: root.iconFamily
+        font.pixelSize: iconSize
+        font.hintingPreference: Font.PreferNoHinting
+        font.variableAxes: ({ "FILL": fill, "opsz": iconSize })
+    }
+
+    component Keycap: Rectangle {
+        property alias text: keyLabel.text
+        implicitWidth: keyLabel.implicitWidth + 10
+        implicitHeight: 18
+        radius: 5
+        color: root.colors.surface_container_high
+        border.width: 1
+        border.color: root.colors.outline_variant
+
+        Text {
+            id: keyLabel
+            anchors.centerIn: parent
+            color: root.colors.on_surface_variant
+            font.family: root.monoFamily
+            font.pixelSize: 9
+        }
+    }
+
+    component IconButton: Rectangle {
+        id: iconButton
+        property string icon
+        property bool spinning: false
+        signal clicked()
+
+        implicitWidth: 32
+        implicitHeight: 32
+        radius: 16
+        color: buttonMouse.pressed
+            ? root.colors.surface_container_highest
+            : buttonMouse.containsMouse ? root.colors.surface_container_high : "transparent"
+
+        Symbol {
+            id: buttonIcon
+            anchors.centerIn: parent
+            text: iconButton.icon
+            iconSize: 20
+
+            RotationAnimation on rotation {
+                running: iconButton.spinning
+                loops: Animation.Infinite
+                from: 0
+                to: 360
+                duration: 900
+                onRunningChanged: if (!running) buttonIcon.rotation = 0
+            }
+        }
+
+        MouseArea {
+            id: buttonMouse
+            anchors.fill: parent
+            hoverEnabled: true
+            cursorShape: Qt.PointingHandCursor
+            onClicked: iconButton.clicked()
         }
     }
 
@@ -439,13 +619,14 @@ ShellRoot {
         id: providerCard
 
         required property string providerId
-        required property string providerName
         readonly property var usageWindows: root.windowsFor(providerId)
         readonly property string errorText: root.providerError(providerId)
+        readonly property string plan: root.providerPlan(providerId)
+        readonly property color accent: root.providerAccent(providerId)
 
-        color: root.palette.surface_container_high
-        radius: 13
-        implicitHeight: providerColumn.implicitHeight + 20
+        color: root.colors.surface_container_low
+        radius: 16
+        implicitHeight: providerColumn.implicitHeight + 26
 
         ColumnLayout {
             id: providerColumn
@@ -453,122 +634,245 @@ ShellRoot {
                 top: parent.top
                 left: parent.left
                 right: parent.right
-                margins: 10
+                margins: 13
             }
-            spacing: 8
+            spacing: 12
 
             RowLayout {
                 Layout.fillWidth: true
-                spacing: 9
+                spacing: 10
 
-                IconImage {
-                    Layout.preferredWidth: 25
-                    Layout.preferredHeight: 25
-                    source: root.providerIcon(providerCard.providerId)
+                Rectangle {
+                    Layout.preferredWidth: 34
+                    Layout.preferredHeight: 34
+                    radius: 10
+                    color: Qt.alpha(providerCard.accent, 0.16)
+
+                    IconImage {
+                        anchors.centerIn: parent
+                        implicitSize: 22
+                        source: root.providerIcon(providerCard.providerId)
+                    }
                 }
 
-                Text {
-                    text: providerCard.providerName
-                    color: root.palette.on_background
-                    font.family: root.fontFamily
-                    font.pixelSize: 14
-                    font.weight: Font.DemiBold
+                ColumnLayout {
+                    Layout.fillWidth: true
+                    spacing: 1
+
+                    UiText {
+                        Layout.fillWidth: true
+                        text: root.providerName(providerCard.providerId)
+                        font.pixelSize: 14
+                        font.weight: Font.DemiBold
+                    }
+                    UiText {
+                        Layout.fillWidth: true
+                        visible: text.length > 0
+                        text: providerCard.plan
+                        color: root.colors.on_surface_variant
+                        font.pixelSize: 11
+                    }
                 }
 
-                Item { Layout.fillWidth: true }
-
-                Text {
+                UiText {
                     visible: providerCard.usageWindows.length > 0
-                    text: root.compactPercent(providerCard.providerId)
-                    color: root.providerAccent(providerCard.providerId)
+                    text: `${Math.round(providerCard.usageWindows[0]?.usedPercent ?? 0)}%`
+                    color: root.levelColor(providerCard.usageWindows[0]?.usedPercent ?? 0, providerCard.accent)
                     font.family: root.monoFamily
-                    font.pixelSize: 12
+                    font.pixelSize: 20
                     font.weight: Font.DemiBold
                 }
             }
 
-            Text {
+            Rectangle {
                 Layout.fillWidth: true
                 visible: providerCard.errorText.length > 0
-                text: providerCard.errorText
-                color: root.palette.error
-                font.family: root.fontFamily
-                font.pixelSize: 11
-                wrapMode: Text.Wrap
+                implicitHeight: errorRow.implicitHeight + 16
+                radius: 10
+                color: Qt.alpha(root.colors.error_container, 0.28)
+
+                RowLayout {
+                    id: errorRow
+                    anchors {
+                        verticalCenter: parent.verticalCenter
+                        left: parent.left
+                        right: parent.right
+                        leftMargin: 10
+                        rightMargin: 10
+                    }
+                    spacing: 8
+
+                    Symbol {
+                        text: "error"
+                        fill: 1
+                        color: root.colors.error
+                        iconSize: 16
+                    }
+                    UiText {
+                        Layout.fillWidth: true
+                        text: providerCard.errorText
+                        color: root.colors.on_error_container
+                        font.pixelSize: 11
+                        wrapMode: Text.Wrap
+                    }
+                }
             }
 
             Repeater {
                 model: providerCard.usageWindows
                 delegate: ColumnLayout {
+                    id: windowRow
                     required property var modelData
                     Layout.fillWidth: true
-                    spacing: 4
+                    spacing: 5
 
                     RowLayout {
                         Layout.fillWidth: true
-                        Text {
-                            text: modelData.label
-                            color: root.palette.on_surface_variant
-                            font.family: root.fontFamily
-                            font.pixelSize: 11
+                        UiText {
+                            Layout.fillWidth: true
+                            text: windowRow.modelData.label
+                            color: root.colors.on_surface_variant
+                            font.pixelSize: 12
+                            font.weight: Font.Medium
                         }
-                        Item { Layout.fillWidth: true }
-                        Text {
-                            text: `${Math.round(modelData.usedPercent)}% использовано`
-                            color: root.palette.on_background
+                        UiText {
+                            text: `${Math.round(windowRow.modelData.usedPercent)}%`
                             font.family: root.monoFamily
-                            font.pixelSize: 10
+                            font.pixelSize: 11
                         }
                     }
 
                     UsageBar {
                         Layout.fillWidth: true
-                        value: modelData.usedPercent
-                        accent: root.providerAccent(providerCard.providerId)
+                        value: windowRow.modelData.usedPercent
+                        expected: windowRow.modelData.expectedPercent
+                        accent: providerCard.accent
                     }
 
-                    Text {
-                        text: root.formatReset(modelData.resetsAt)
-                        color: root.palette.on_surface_variant
-                        font.family: root.fontFamily
-                        font.pixelSize: 10
+                    RowLayout {
+                        Layout.fillWidth: true
+                        spacing: 8
+                        UiText {
+                            Layout.fillWidth: true
+                            text: root.formatReset(windowRow.modelData.resetsAt)
+                            color: root.colors.outline
+                            font.pixelSize: 10
+                            elide: Text.ElideRight
+                        }
+                        UiText {
+                            visible: text.length > 0
+                            text: windowRow.modelData.paceText
+                            color: windowRow.modelData.paceWarning ? root.warningColor : root.colors.outline
+                            font.pixelSize: 10
+                        }
                     }
                 }
             }
         }
     }
 
-    component CompactProvider: Item {
-        id: compactProvider
+    component PillProvider: RowLayout {
+        id: pillProvider
 
         required property string providerId
-        implicitHeight: 15
+        readonly property real percent: root.primaryPercent(providerId)
+        readonly property bool failed: percent < 0 && root.providerError(providerId).length > 0
+        readonly property color levelColor: root.levelColor(percent, root.providerAccent(providerId))
 
-        RowLayout {
-            anchors.fill: parent
-            spacing: 4
+        spacing: 5
+
+        Item {
+            Layout.preferredWidth: 22
+            Layout.preferredHeight: 22
+
+            UsageRing {
+                anchors.fill: parent
+                value: Math.max(0, pillProvider.percent)
+                accent: pillProvider.levelColor
+            }
 
             IconImage {
-                Layout.preferredWidth: 12
-                Layout.preferredHeight: 12
-                source: root.providerIcon(compactProvider.providerId)
+                anchors.centerIn: parent
+                implicitSize: 13
+                source: root.providerIcon(pillProvider.providerId)
+                opacity: pillProvider.failed ? 0.45 : 1
+            }
+        }
+
+        Item {
+            Layout.preferredWidth: percentMetrics.width
+            Layout.preferredHeight: percentText.implicitHeight
+
+            TextMetrics {
+                id: percentMetrics
+                text: "100%"
+                font: percentText.font
             }
 
-            UsageBar {
-                Layout.fillWidth: true
-                Layout.preferredHeight: 3
-                value: root.compactValue(compactProvider.providerId)
-                accent: root.providerAccent(compactProvider.providerId)
+            Symbol {
+                anchors.centerIn: parent
+                visible: pillProvider.failed
+                text: "error"
+                fill: 1
+                color: root.colors.error
+                iconSize: 15
             }
 
-            Text {
-                Layout.preferredWidth: 25
-                horizontalAlignment: Text.AlignRight
-                text: root.compactPercent(compactProvider.providerId)
-                color: root.providerAccent(compactProvider.providerId)
-                font.family: root.monoFamily
-                font.pixelSize: 9
-                font.weight: Font.Bold
+            UiText {
+                id: percentText
+                anchors.right: parent.right
+                anchors.verticalCenter: parent.verticalCenter
+                visible: !pillProvider.failed
+                text: pillProvider.percent >= 0 ? `${Math.round(pillProvider.percent)}%` : "—"
+                color: pillProvider.percent >= 75 ? pillProvider.levelColor : root.colors.on_surface_variant
+                font.pixelSize: 12
+                font.weight: Font.Medium
+            }
+        }
+    }
+
+    component UsageRing: Item {
+        id: ring
+        required property real value
+        required property color accent
+        property real lineWidth: 2.5
+        readonly property real arcRadius: Math.min(width, height) / 2 - lineWidth / 2
+
+        property real animatedValue: value
+        Behavior on animatedValue { NumberAnimation { duration: 600; easing.type: Easing.OutCubic } }
+
+        Shape {
+            anchors.fill: parent
+            preferredRendererType: Shape.CurveRenderer
+
+            ShapePath {
+                strokeColor: Qt.alpha(root.colors.outline_variant, 0.9)
+                strokeWidth: ring.lineWidth
+                fillColor: "transparent"
+                capStyle: ShapePath.RoundCap
+                PathAngleArc {
+                    centerX: ring.width / 2
+                    centerY: ring.height / 2
+                    radiusX: ring.arcRadius
+                    radiusY: ring.arcRadius
+                    startAngle: 0
+                    sweepAngle: 360
+                }
+            }
+
+            ShapePath {
+                strokeColor: ring.animatedValue > 0 ? ring.accent : "transparent"
+                strokeWidth: ring.lineWidth
+                fillColor: "transparent"
+                capStyle: ShapePath.RoundCap
+                PathAngleArc {
+                    centerX: ring.width / 2
+                    centerY: ring.height / 2
+                    radiusX: ring.arcRadius
+                    radiusY: ring.arcRadius
+                    startAngle: -90
+                    sweepAngle: 360 * Math.max(0, Math.min(100, ring.animatedValue)) / 100
+                }
             }
         }
     }
@@ -577,13 +881,16 @@ ShellRoot {
         id: usageBar
         required property real value
         required property color accent
-        implicitHeight: 7
+        property real expected: -1
+        implicitHeight: 8
+
+        property real animatedValue: value
+        Behavior on animatedValue { NumberAnimation { duration: 600; easing.type: Easing.OutCubic } }
 
         Rectangle {
             anchors.fill: parent
             radius: height / 2
-            color: root.palette.outline_variant
-            opacity: 0.7
+            color: Qt.alpha(root.colors.outline_variant, 0.7)
         }
 
         Rectangle {
@@ -592,9 +899,22 @@ ShellRoot {
                 bottom: parent.bottom
                 left: parent.left
             }
-            width: parent.width * Math.max(0, Math.min(100, usageBar.value)) / 100
+            width: Math.max(height, parent.width * Math.max(0, Math.min(100, usageBar.animatedValue)) / 100)
+            visible: usageBar.value > 0
             radius: height / 2
-            color: usageBar.value >= 90 ? root.palette.error : usageBar.value >= 75 ? "#f3b562" : usageBar.accent
+            color: root.levelColor(usageBar.value, usageBar.accent)
+        }
+
+        // Where usage "should" be if spread evenly across the window.
+        Rectangle {
+            visible: usageBar.expected >= 0
+            x: Math.round(usageBar.width * Math.min(100, usageBar.expected) / 100 - width / 2)
+            anchors.verticalCenter: parent.verticalCenter
+            width: 2
+            height: parent.height + 6
+            radius: 1
+            color: root.colors.on_background
+            opacity: 0.8
         }
     }
 }
